@@ -5,14 +5,15 @@ import time
 import re
 import json
 import random
+import os
 from datetime import datetime, timedelta
 import pytz
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from google.auth.transport.requests import Request
-from googleapiclient.errors import HttpError
 
 # ========================================
 # Streamlit Page Setup
@@ -41,7 +42,33 @@ CLIENT_CONFIG = {
 }
 
 # ========================================
-# Helper Functions
+# Recovery Logic for Completed Session
+# ========================================
+DONE_FILE = "/tmp/mailmerge_done.json"
+
+if os.path.exists(DONE_FILE) and not st.session_state.get("done", False):
+    try:
+        with open(DONE_FILE, "r") as f:
+            done_info = json.load(f)
+        file_path = done_info.get("file")
+        if file_path and os.path.exists(file_path):
+            st.success("✅ Previous mail merge completed successfully.")
+            st.download_button(
+                "⬇️ Download Updated CSV",
+                data=open(file_path, "rb"),
+                file_name=os.path.basename(file_path),
+                mime="text/csv",
+            )
+            if st.button("🔁 Reset for New Run"):
+                os.remove(DONE_FILE)
+                st.session_state.clear()
+                st.experimental_rerun()
+            st.stop()
+    except Exception:
+        pass
+
+# ========================================
+# Helpers
 # ========================================
 EMAIL_REGEX = re.compile(r"[\w\.-]+@[\w\.-]+\.\w+")
 
@@ -50,7 +77,6 @@ def extract_email(value: str):
         return None
     match = EMAIL_REGEX.search(str(value))
     return match.group(0) if match else None
-
 
 def convert_bold(text):
     if not text:
@@ -70,45 +96,56 @@ def convert_bold(text):
     </html>
     """
 
-
 def get_or_create_label(service, label_name="Mail Merge Sent"):
     try:
         labels = service.users().labels().list(userId="me").execute().get("labels", [])
         for label in labels:
             if label["name"].lower() == label_name.lower():
                 return label["id"]
-        label_obj = {
-            "name": label_name,
-            "labelListVisibility": "labelShow",
-            "messageListVisibility": "show",
-        }
+        label_obj = {"name": label_name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}
         created_label = service.users().labels().create(userId="me", body=label_obj).execute()
         return created_label["id"]
     except Exception as e:
         st.warning(f"Could not get/create label: {e}")
         return None
 
-
-def safe_format_template(template: str, row: pd.Series):
+def send_email_backup(service, csv_path):
     try:
-        return template.format(**(row.to_dict()))
-    except Exception:
-        try:
-            keys = re.findall(r"\{(.*?)\}", template)
-            ctx = {k: str(row.get(k, "")) for k in keys}
-            return template.format(**ctx)
-        except Exception:
-            return template
+        user_profile = service.users().getProfile(userId="me").execute()
+        user_email = user_profile.get("emailAddress")
 
+        msg = MIMEMultipart()
+        msg["To"] = user_email
+        msg["From"] = user_email
+        msg["Subject"] = f"📁 Mail Merge Backup CSV - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        body = MIMEText("Attached is the backup CSV for your mail merge run.", "plain")
+        msg.attach(body)
 
-def ensure_creds_and_update_session(creds):
-    try:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            st.session_state["creds"] = creds.to_json()
+        with open(csv_path, "rb") as f:
+            part = MIMEApplication(f.read(), Name=os.path.basename(csv_path))
+        part["Content-Disposition"] = f'attachment; filename="{os.path.basename(csv_path)}"'
+        msg.attach(part)
+
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        service.users().messages().send(userId="me", body={"raw": raw}).execute()
+        st.info(f"📧 Backup CSV emailed to {user_email}")
     except Exception as e:
-        st.warning(f"Could not refresh credentials: {e}")
-    return creds
+        st.warning(f"⚠️ Could not send backup email: {e}")
+
+def fetch_message_id_header(service, message_id):
+    for _ in range(6):
+        try:
+            msg_detail = service.users().messages().get(
+                userId="me", id=message_id, format="metadata", metadataHeaders=["Message-ID"]
+            ).execute()
+            headers = msg_detail.get("payload", {}).get("headers", [])
+            for h in headers:
+                if h.get("name", "").lower() == "message-id":
+                    return h.get("value")
+        except Exception:
+            pass
+        time.sleep(random.uniform(1, 2))
+    return ""
 
 # ========================================
 # OAuth Flow
@@ -130,214 +167,227 @@ else:
     else:
         flow = Flow.from_client_config(CLIENT_CONFIG, scopes=SCOPES)
         flow.redirect_uri = st.secrets["gmail"]["redirect_uri"]
-        auth_url, _ = flow.authorization_url(
-            prompt="consent", access_type="offline", include_granted_scopes="true"
-        )
-        st.markdown(
-            f"### 🔑 Please [authorize the app]({auth_url}) to send emails using your Gmail account."
-        )
+        auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline", include_granted_scopes="true")
+        st.markdown(f"### 🔑 Please [authorize the app]({auth_url}) to send emails using your Gmail account.")
         st.stop()
 
 creds = Credentials.from_authorized_user_info(json.loads(st.session_state["creds"]), SCOPES)
-creds = ensure_creds_and_update_session(creds)
 service = build("gmail", "v1", credentials=creds)
 
 # ========================================
-# Upload Recipients
+# Session State Setup
 # ========================================
-st.header("📤 Upload Recipient List")
-st.info("⚠️ Upload maximum of **70–80 contacts** for safe Gmail sending.")
+if "sending" not in st.session_state:
+    st.session_state["sending"] = False
+if "done" not in st.session_state:
+    st.session_state["done"] = False
 
-uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
+# ========================================
+# MAIN UI
+# ========================================
+if not st.session_state["sending"]:
+    st.header("📤 Upload Recipient List")
+    st.info("⚠️ Upload up to **70–80 contacts** for smooth performance.")
 
-if uploaded_file:
-    if uploaded_file.name.endswith("csv"):
-        df = pd.read_csv(uploaded_file)
-    else:
-        df = pd.read_excel(uploaded_file)
+    uploaded_file = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx"])
 
-    st.write("✅ Preview of uploaded data:")
-    st.dataframe(df.head())
-    st.info("📌 Include 'ThreadId' and 'RfcMessageId' columns for follow-ups if needed.")
+    if uploaded_file:
+        if uploaded_file.name.lower().endswith("csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
 
-    # ========================================
-    # Email Template
-    # ========================================
-    st.header("✍️ Compose Your Email")
-    subject_template = st.text_input("Subject", "Hello {Name}")
-    body_template = st.text_area(
-        "Body (supports **bold**, [link](https://example.com), and line breaks)",
-        """Dear {Name},
+        st.dataframe(df.head())
+        st.info("📌 Include 'ThreadId' and 'RfcMessageId' columns for follow-ups if needed.")
+        df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
 
-Welcome to our **Mail Merge App** demo.
+        subject_template = st.text_input("Subject", "Hello {Name}")
+        body_template = st.text_area(
+            "Body",
+            """Dear {Name},
 
-You can add links like [Visit Google](https://google.com)
-and preserve formatting exactly.
+Welcome to **Mail Merge App** demo.
 
 Thanks,  
 **Your Company**""",
-        height=250,
-    )
+            height=250,
+        )
 
-    # ========================================
-    # Preview Section
-    # ========================================
-    st.subheader("👁️ Preview Email")
-    if not df.empty and "Email" in df.columns:
-        recipient_options = df["Email"].astype(str).tolist()
-        selected_email = st.selectbox("Select recipient to preview", recipient_options)
-        try:
-            preview_row = df[df["Email"] == selected_email].iloc[0]
-            preview_subject = safe_format_template(subject_template, preview_row)
-            preview_body = safe_format_template(body_template, preview_row)
-            preview_html = convert_bold(preview_body)
+        # =============================
+        # 👁️ TEMPLATE PREVIEW (added safely)
+        # =============================
+        if uploaded_file is not None and not df.empty:
+            st.markdown("### 👁️ Template Preview")
+            try:
+                sample_row = df.iloc[0].to_dict()
+                preview_subject = subject_template.format(**sample_row)
+                preview_body_html = convert_bold(body_template.format(**sample_row))
+                st.write(f"**📨 Preview Subject:** {preview_subject}")
+                st.markdown(
+                    f"<div style='border:1px solid #ddd; padding:10px; border-radius:8px;'>{preview_body_html}</div>",
+                    unsafe_allow_html=True,
+                )
+            except Exception as e:
+                st.warning(f"⚠️ Preview unavailable: {e}")
 
-            st.markdown(
-                f'<span style="font-family: Verdana, sans-serif; font-size:16px;"><b>Subject:</b> {preview_subject}</span>',
-                unsafe_allow_html=True
-            )
-            st.markdown("---")
-            st.markdown(preview_html, unsafe_allow_html=True)
-        except KeyError as e:
-            st.error(f"⚠️ Missing column in data: {e}")
+        label_name = st.text_input("Gmail label", "Mail Merge Sent")
+        delay = st.slider("Delay (seconds)", 20, 75, 20)
 
-    # ========================================
-    # Label & Timing Options
-    # ========================================
-    st.header("🏷️ Label & Timing Options")
-    label_name = st.text_input("Gmail label to apply (new emails only)", value="Mail Merge Sent")
+        send_mode = st.radio("Choose mode", ["🆕 New Email", "↩️ Follow-up (Reply)", "💾 Save as Draft"])
 
-    delay = st.slider(
-        "Delay between emails (seconds)",
-        min_value=30,
-        max_value=300,
-        value=30,
-        step=5,
-        help="Minimum 30 seconds delay required for safe Gmail sending."
-    )
+        if st.button("🚀 Send Emails / Save Drafts"):
+            st.session_state.update({
+                "sending": True,
+                "df": df,
+                "subject_template": subject_template,
+                "body_template": body_template,
+                "label_name": label_name,
+                "delay": delay,
+                "send_mode": send_mode
+            })
+            st.rerun()
 
-    # ========================================
-    # ✅ "Ready to Send" Button + ETA
-    # ========================================
-    eta_ready = st.button("🕒 Ready to Send / Calculate ETA")
+# ========================================
+# SENDING MODE
+# ========================================
+if st.session_state["sending"]:
+    df = st.session_state["df"]
+    subject_template = st.session_state["subject_template"]
+    body_template = st.session_state["body_template"]
+    label_name = st.session_state["label_name"]
+    delay = st.session_state["delay"]
+    send_mode = st.session_state["send_mode"]
 
-    if eta_ready:
-        try:
-            total_contacts = len(df)
-            total_seconds = total_contacts * delay
-            total_minutes = total_seconds / 60
+    st.markdown("<h3>📨 Sending emails... please wait.</h3>", unsafe_allow_html=True)
+    progress = st.progress(0)
+    status_box = st.empty()
 
-            local_tz = pytz.timezone("Asia/Kolkata")
-            now_local = datetime.now(local_tz)
-            eta_end = now_local + timedelta(seconds=total_seconds)
+    with open("/tmp/mailmerge_running.json", "w") as f:
+        json.dump({"start": str(datetime.now()), "total": len(df)}, f)
 
-            st.success(
-                f"📋 Total Recipients: {total_contacts}\n\n"
-                f"⏳ Estimated Duration: {total_minutes:.1f} min\n\n"
-                f"🕒 ETA End: **{eta_end.strftime('%I:%M %p')}** (Local Time)"
-            )
-        except Exception as e:
-            st.warning(f"ETA calculation failed: {e}")
-
-    # ========================================
-    # Send Mode
-    # ========================================
-    send_mode = st.radio(
-        "Choose sending mode",
-        ["🆕 New Email", "↩️ Follow-up (Reply)", "💾 Save as Draft"]
-    )
-
-    # ========================================
-    # Main Send / Draft Button
-    # ========================================
-    if st.button("🚀 Send Emails / Save Drafts"):
+    label_id = None
+    if send_mode == "🆕 New Email":
         label_id = get_or_create_label(service, label_name)
-        sent_count = 0
-        skipped, errors = [], []
 
-        with st.spinner("📨 Processing emails... please wait."):
-            if "ThreadId" not in df.columns:
-                df["ThreadId"] = None
-            if "RfcMessageId" not in df.columns:
-                df["RfcMessageId"] = None
+    if "ThreadId" not in df.columns:
+        df["ThreadId"] = None
+    if "RfcMessageId" not in df.columns:
+        df["RfcMessageId"] = None
 
-            progress = st.progress(0)
+    total = len(df)
+    if total == 0:
+        st.error("❌ No rows found in uploaded file.")
+        st.stop()
 
-            for idx, row in df.iterrows():
-                progress.progress((idx + 1) / len(df))
-                to_addr = extract_email(str(row.get("Email", "")).strip())
-                if not to_addr:
-                    skipped.append(row.get("Email"))
-                    continue
+    sent_count, skipped, errors = 0, [], []
 
-                try:
-                    subject = safe_format_template(subject_template, row)
-                    body_html = convert_bold(safe_format_template(body_template, row))
-                    message = MIMEText(body_html, "html")
-                    message["To"] = to_addr
-                    message["Subject"] = subject
+    for idx, row in df.iterrows():
+        pct = int(((idx + 1) / total) * 100)
+        progress.progress(min(max(pct, 0), 100))
+        status_box.info(f"Processing {idx + 1}/{total}")
 
-                    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+        to_addr = extract_email(str(row.get("Email", "")).strip())
+        if not to_addr:
+            skipped.append(row.get("Email"))
+            continue
+
+        try:
+            subject = subject_template.format(**row)
+            body_html = convert_bold(body_template.format(**row))
+            message = MIMEText(body_html, "html")
+            message["To"] = to_addr
+            message["Subject"] = subject
+
+            msg_body = {}
+            if send_mode == "↩️ Follow-up (Reply)":
+                thread_id = str(row.get("ThreadId", "")).strip()
+                rfc_id = str(row.get("RfcMessageId", "")).strip()
+                if thread_id and rfc_id:
+                    message["In-Reply-To"] = rfc_id
+                    message["References"] = rfc_id
+                    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+                    msg_body = {"raw": raw, "threadId": thread_id}
+                else:
+                    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
                     msg_body = {"raw": raw}
+            else:
+                raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+                msg_body = {"raw": raw}
 
-                    if send_mode == "💾 Save as Draft":
-                        draft = service.users().drafts().create(userId="me", body={"message": msg_body}).execute()
-                        sent_msg = draft.get("message", {})
-                        st.info(f"📝 Draft saved for {to_addr}")
-                    else:
-                        sent_msg = service.users().messages().send(userId="me", body=msg_body).execute()
+            if send_mode == "💾 Save as Draft":
+                draft = service.users().drafts().create(userId="me", body={"message": msg_body}).execute()
+                df.loc[idx, "ThreadId"] = draft.get("message", {}).get("threadId", "")
+                df.loc[idx, "RfcMessageId"] = draft.get("message", {}).get("id", "")
+                st.info(f"📝 Draft saved for {to_addr}")
+            else:
+                sent_msg = service.users().messages().send(userId="me", body=msg_body).execute()
+                msg_id = sent_msg.get("id", "")
+                df.loc[idx, "ThreadId"] = sent_msg.get("threadId", "")
+                message_id_header = fetch_message_id_header(service, msg_id)
+                df.loc[idx, "RfcMessageId"] = message_id_header or msg_id
+                if send_mode == "🆕 New Email" and label_id:
+                    try:
+                        service.users().messages().modify(
+                            userId="me", id=msg_id, body={"addLabelIds": [label_id]}
+                        ).execute()
+                    except Exception:
+                        pass
+                st.info(f"✅ Sent to {to_addr}")
 
-                    if delay > 0:
-                        time.sleep(random.uniform(delay * 0.9, delay * 1.1))
+            sent_count += 1
+            if send_mode != "💾 Save as Draft":
+                time.sleep(random.uniform(delay * 0.9, delay * 1.1))
+        except Exception as e:
+            errors.append((to_addr, str(e)))
+            st.error(f"Error for {to_addr}: {e}")
 
-                    message_id_header = None
-                    msg_detail = service.users().messages().get(
-                        userId="me",
-                        id=sent_msg.get("id", ""),
-                        format="metadata",
-                        metadataHeaders=["Message-ID"],
-                    ).execute()
+    progress.progress(100)
 
-                    headers = msg_detail.get("payload", {}).get("headers", [])
-                    for h in headers:
-                        if h.get("name", "").lower() == "message-id":
-                            message_id_header = h.get("value")
-                            break
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_label = re.sub(r'[^A-Za-z0-9_-]', '_', label_name)
+    file_name = f"Updated_{safe_label}_{timestamp}.csv"
+    file_path = os.path.join("/tmp", file_name)
+    df.to_csv(file_path, index=False)
 
-                    if send_mode == "🆕 New Email" and label_id and sent_msg.get("id"):
-                        try:
-                            service.users().messages().modify(
-                                userId="me",
-                                id=sent_msg["id"],
-                                body={"addLabelIds": [label_id]},
-                            ).execute()
-                        except Exception:
-                            st.warning(f"⚠️ Could not apply label to {to_addr}")
+    try:
+        send_email_backup(service, file_path)
+    except Exception as e:
+        st.warning(f"Backup email failed: {e}")
 
-                    df.loc[idx, "ThreadId"] = sent_msg.get("threadId", "")
-                    df.loc[idx, "RfcMessageId"] = message_id_header or ""
-                    sent_count += 1
+    with open(DONE_FILE, "w") as f:
+        json.dump({"done_time": str(datetime.now()), "file": file_path}, f)
+    if os.path.exists("/tmp/mailmerge_running.json"):
+        os.remove("/tmp/mailmerge_running.json")
 
-                except Exception as e:
-                    errors.append((to_addr, str(e)))
+    st.session_state["sending"] = False
+    st.session_state["done"] = True
+    st.session_state["summary"] = {"sent": sent_count, "errors": errors, "skipped": skipped}
+    st.rerun()
 
-        # ========================================
-        # Summary + Stable Download (NO auto-download)
-        # ========================================
-        st.success(f"✅ Processed {sent_count} emails successfully.")
-        if skipped:
-            st.warning(f"⚠️ Skipped {len(skipped)} invalid emails.")
-        if errors:
-            st.error(f"❌ Failed for {len(errors)} emails.")
+# ========================================
+# COMPLETION STATE
+# ========================================
+if st.session_state["done"]:
+    summary = st.session_state.get("summary", {})
+    st.success(f"✅ Process completed. Sent: {summary.get('sent', 0)}")
+    if summary.get("errors"):
+        st.error(f"❌ {len(summary['errors'])} errors occurred.")
+    if summary.get("skipped"):
+        st.warning(f"⚠️ Skipped: {summary['skipped']}")
 
-        # Fixed: Manual download only
-        csv_bytes = df.to_csv(index=False).encode("utf-8")
-        file_name = f"Updated_{label_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-
-        st.info("📂 Click below to manually download the updated CSV (with ThreadId and RfcMessageId):")
+    with open(DONE_FILE, "r") as f:
+        done_info = json.load(f)
+    file_path = done_info.get("file")
+    if file_path and os.path.exists(file_path):
         st.download_button(
-            label="⬇️ Download Updated CSV",
-            data=csv_bytes,
-            file_name=file_name,
+            "⬇️ Download Updated CSV",
+            data=open(file_path, "rb"),
+            file_name=os.path.basename(file_path),
             mime="text/csv",
         )
+
+    if st.button("🔁 New Run / Reset"):
+        if os.path.exists(DONE_FILE):
+            os.remove(DONE_FILE)
+        st.session_state.clear()
+        st.experimental_rerun()
